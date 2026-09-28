@@ -293,7 +293,66 @@ class OperatorCoordinatorHolderTest {
     }
 
     @Test
-    void coordinatorFailureBeforeInitializationFailsTheJobOnceInitialized() throws Exception {
+    void failureDuringRestoreFromFileBeforeInitializationFailsTheJobOnceInitialized()
+            throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        context ->
+                                new TestingOperatorCoordinator(context) {
+                                    @Override
+                                    public boolean supportsCoordinatorStateInFile() {
+                                        return true;
+                                    }
+
+                                    @Override
+                                    public void resetToCheckpointFromHandle(
+                                            long checkpointId, StreamStateHandle checkpointState) {
+                                        context.failJob(new Exception("Cannot restore"));
+                                    }
+                                });
+
+        // like the initial restore, which happens before the scheduler initializes the holder
+        holder.resetToCheckpointFromHandle(
+                1L, new FileStateHandle(new Path("file:///coordinator-state"), 4096));
+        assertThat(globalFailure).isNull();
+
+        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
+
+        assertThat(globalFailure).hasRootCauseMessage("Cannot restore");
+        globalFailure = null;
+    }
+
+    @Test
+    void failureOfSupersededRestoreFromFileBeforeInitializationDoesNotFailTheJob()
+            throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        context ->
+                                new TestingOperatorCoordinator(context) {
+                                    @Override
+                                    public boolean supportsCoordinatorStateInFile() {
+                                        return true;
+                                    }
+
+                                    @Override
+                                    public void resetToCheckpointFromHandle(
+                                            long checkpointId, StreamStateHandle checkpointState) {
+                                        context.failJob(new Exception("Cannot restore"));
+                                    }
+                                });
+
+        holder.resetToCheckpointFromHandle(
+                1L, new FileStateHandle(new Path("file:///coordinator-state"), 4096));
+        holder.resetToCheckpoint(2L, new byte[0]);
+        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
+
+        assertThat(globalFailure).isNull();
+    }
+
+    @Test
+    void failureBeforeInitializationOutsideARestoreFromFileIsRejected() throws Exception {
         final OperatorCoordinatorHolder holder =
                 createUninitializedCoordinatorHolder(
                         EventReceivingTasks.createForRunningTasks(),
@@ -306,39 +365,9 @@ class OperatorCoordinatorHolderTest {
                                     }
                                 });
 
-        // like the initial restore, which happens before the scheduler initializes the holder
-        holder.resetToCheckpoint(1L, new byte[0]);
-        assertThat(globalFailure).isNull();
-
-        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
-
-        assertThat(globalFailure).hasRootCauseMessage("Cannot restore");
-        globalFailure = null;
-    }
-
-    @Test
-    void failureOfSupersededRestoreBeforeInitializationDoesNotFailTheJob() throws Exception {
-        final boolean[] failNextRestore = {true};
-        final OperatorCoordinatorHolder holder =
-                createUninitializedCoordinatorHolder(
-                        EventReceivingTasks.createForRunningTasks(),
-                        context ->
-                                new TestingOperatorCoordinator(context) {
-                                    @Override
-                                    public void resetToCheckpoint(
-                                            long checkpointId, @Nullable byte[] checkpointData) {
-                                        if (failNextRestore[0]) {
-                                            failNextRestore[0] = false;
-                                            context.failJob(new Exception("Cannot restore"));
-                                        }
-                                    }
-                                });
-
-        holder.resetToCheckpoint(1L, new byte[0]);
-        holder.resetToCheckpoint(2L, new byte[0]);
-        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
-
-        assertThat(globalFailure).isNull();
+        assertThatThrownBy(() -> holder.resetToCheckpoint(1L, new byte[0]))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Context was not yet initialized");
     }
 
     @Test

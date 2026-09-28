@@ -310,6 +310,9 @@ public class OperatorCoordinatorHolder
                 operatorId,
                 checkpointState);
         prepareReset();
+        // the coordinator reads the file in another thread, and may report a failure to read it
+        // before the scheduler initializes the context during the initial restore
+        context.holdFailuresUntilInitialized();
         coordinator.resetToCheckpointFromHandle(checkpointId, checkpointState);
     }
 
@@ -628,10 +631,13 @@ public class OperatorCoordinatorHolder
         private volatile boolean failed;
 
         /**
-         * A failure reported before the context was initialized, for example by a coordinator that
-         * could not restore its state during the initial restore. It fails the job on
-         * initialization.
+         * Whether a failure reported before initialization is held until then instead of being
+         * rejected. Only set by a restore from a file before initialization.
          */
+        @GuardedBy("this")
+        private boolean holdFailuresUntilInitialized;
+
+        /** A failure held until initialization, which then fails the job. */
         @GuardedBy("this")
         @Nullable
         private Throwable failureBeforeInitialization;
@@ -666,6 +672,7 @@ public class OperatorCoordinatorHolder
                 this.schedulerExecutor = checkNotNull(schedulerExecutor);
                 this.checkpointCoordinator = checkpointCoordinator;
                 this.operatorParallelism = operatorParallelism;
+                holdFailuresUntilInitialized = false;
                 failure = failureBeforeInitialization;
                 failureBeforeInitialization = null;
             }
@@ -686,6 +693,12 @@ public class OperatorCoordinatorHolder
 
         private void checkInitialized() {
             checkState(isInitialized(), "Context was not yet initialized");
+        }
+
+        synchronized void holdFailuresUntilInitialized() {
+            if (!isInitialized()) {
+                holdFailuresUntilInitialized = true;
+            }
         }
 
         void resetFailed() {
@@ -719,13 +732,14 @@ public class OperatorCoordinatorHolder
         @Override
         public void failJob(final Throwable cause) {
             synchronized (this) {
-                if (!isInitialized()) {
+                if (!isInitialized() && holdFailuresUntilInitialized) {
                     if (failureBeforeInitialization == null) {
                         failureBeforeInitialization = cause;
                     }
                     return;
                 }
             }
+            checkInitialized();
 
             final FlinkException e =
                     new FlinkException(
