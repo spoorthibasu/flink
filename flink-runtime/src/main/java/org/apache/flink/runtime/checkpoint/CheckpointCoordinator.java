@@ -43,7 +43,6 @@ import org.apache.flink.runtime.state.CheckpointStorage;
 import org.apache.flink.runtime.state.CheckpointStorageCoordinatorView;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
 import org.apache.flink.runtime.state.CompletedCheckpointStorageLocation;
-import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.MdcUtils;
@@ -240,6 +239,9 @@ public class CheckpointCoordinator {
 
     private final boolean isExactlyOnceMode;
 
+    /** Whether coordinators that support it may have their state stored in its own file. */
+    private final boolean coordinatorStateInFileEnabled;
+
     private final boolean recoverOutputOnDownstreamTask;
 
     /** Flag represents there is an in-flight trigger request. */
@@ -335,6 +337,7 @@ public class CheckpointCoordinator {
         this.checkpointPlanCalculator = checkNotNull(checkpointPlanCalculator);
         this.clock = checkNotNull(clock);
         this.isExactlyOnceMode = chkConfig.isExactlyOnce();
+        this.coordinatorStateInFileEnabled = chkConfig.isCoordinatorStateInFileEnabled();
         this.unalignedCheckpointsEnabled = chkConfig.isUnalignedCheckpointsEnabled();
         this.recoverOutputOnDownstreamTask = chkConfig.isRecoverOutputOnDownstreamTask();
         this.alignedCheckpointTimeout = chkConfig.getAlignedCheckpointTimeout();
@@ -704,7 +707,8 @@ public class CheckpointCoordinator {
                                                 .triggerAndAcknowledgeAllCoordinatorCheckpointsWithCompletion(
                                                         coordinatorsToCheckpoint,
                                                         pendingCheckpoint,
-                                                        timer);
+                                                        timer,
+                                                        coordinatorStateInFileEnabled);
                                     },
                                     timer);
 
@@ -2149,10 +2153,9 @@ public class CheckpointCoordinator {
 
         for (OperatorCoordinatorCheckpointContext coordContext : coordinatorsToCheckpoint) {
             final OperatorState state = operatorStates.get(coordContext.operatorId());
-            final ByteStreamStateHandle coordinatorState =
-                    state == null ? null : state.getCoordinatorState();
-            final byte[] bytes = coordinatorState == null ? null : coordinatorState.getData();
-            coordContext.resetToCheckpoint(checkpointId, bytes);
+            // state stored in its own file is read by the coordinator itself, off this thread
+            coordContext.resetToCheckpointFromHandle(
+                    checkpointId, state == null ? null : state.getCoordinatorState());
         }
     }
 

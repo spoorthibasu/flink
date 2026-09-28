@@ -43,6 +43,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Map;
 
+import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkState;
 
 /**
@@ -103,6 +104,23 @@ public class MetadataV3Serializer extends MetadataV2V3SerializerBase implements 
     //  version-specific serialization formats
     // ------------------------------------------------------------------------
 
+    /**
+     * Writes the coordinator state of an operator. Up to version 6 it has to be held in memory,
+     * because readers of those versions only accept coordinator state inline in the metadata.
+     */
+    protected void serializeCoordinatorState(
+            @Nullable StreamStateHandle coordinatorState,
+            DataOutputStream dos,
+            SerializationContext context)
+            throws IOException {
+        checkArgument(
+                coordinatorState == null || coordinatorState instanceof ByteStreamStateHandle,
+                "Version %s of the checkpoint metadata can only store coordinator state inline, but got %s.",
+                getVersion(),
+                coordinatorState);
+        serializeStreamStateHandle(coordinatorState, dos, context);
+    }
+
     @Override
     protected void serializeOperatorState(
             OperatorState operatorState, DataOutputStream dos, SerializationContext context)
@@ -116,7 +134,7 @@ public class MetadataV3Serializer extends MetadataV2V3SerializerBase implements 
         dos.writeInt(operatorState.getMaxParallelism());
 
         // Coordinator state
-        serializeStreamStateHandle(operatorState.getCoordinatorState(), dos, context);
+        serializeCoordinatorState(operatorState.getCoordinatorState(), dos, context);
 
         // Sub task states
         if (operatorState.isFullyFinished()) {

@@ -35,6 +35,8 @@ import org.apache.flink.runtime.metrics.groups.InternalOperatorCoordinatorMetric
 import org.apache.flink.runtime.metrics.groups.JobManagerJobMetricGroup;
 import org.apache.flink.runtime.operators.coordination.util.IncompleteFuturesTracker;
 import org.apache.flink.runtime.scheduler.GlobalFailureHandler;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.SerializedValue;
@@ -45,6 +47,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -284,6 +287,33 @@ public class OperatorCoordinatorHolder
     @Override
     public void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData)
             throws Exception {
+        prepareReset();
+        coordinator.resetToCheckpoint(checkpointId, checkpointData);
+    }
+
+    @Override
+    public boolean supportsCoordinatorStateInFile() {
+        return coordinator.supportsCoordinatorStateInFile();
+    }
+
+    @Override
+    public void resetToCheckpointFromHandle(
+            long checkpointId, @Nullable StreamStateHandle checkpointState) throws Exception {
+        if (checkpointState == null || checkpointState instanceof ByteStreamStateHandle) {
+            OperatorCoordinatorCheckpointContext.super.resetToCheckpointFromHandle(
+                    checkpointId, checkpointState);
+            return;
+        }
+        checkState(
+                supportsCoordinatorStateInFile(),
+                "The coordinator state of operator %s is stored in %s, but its coordinator can only restore state held in memory.",
+                operatorId,
+                checkpointState);
+        prepareReset();
+        coordinator.resetToCheckpointFromHandle(checkpointId, checkpointState);
+    }
+
+    private void prepareReset() {
         // the first time this method is called is early during execution graph construction,
         // before the main thread executor is set. hence this conditional check.
         if (mainThreadExecutor != null) {
@@ -302,8 +332,6 @@ public class OperatorCoordinatorHolder
         if (mainThreadExecutor != null) {
             setupAllSubtaskGateways();
         }
-
-        coordinator.resetToCheckpoint(checkpointId, checkpointData);
     }
 
     private void checkpointCoordinatorInternal(
@@ -599,6 +627,15 @@ public class OperatorCoordinatorHolder
 
         private volatile boolean failed;
 
+        /**
+         * A failure reported before the context was initialized, for example by a coordinator that
+         * could not restore its state during the initial restore. It fails the job on
+         * initialization.
+         */
+        @GuardedBy("this")
+        @Nullable
+        private Throwable failureBeforeInitialization;
+
         public LazyInitializedCoordinatorContext(
                 JobInfo jobInfo,
                 final OperatorID operatorId,
@@ -623,10 +660,18 @@ public class OperatorCoordinatorHolder
                 Executor schedulerExecutor,
                 @Nullable CheckpointCoordinator checkpointCoordinator,
                 final int operatorParallelism) {
-            this.globalFailureHandler = checkNotNull(globalFailureHandler);
-            this.schedulerExecutor = checkNotNull(schedulerExecutor);
-            this.checkpointCoordinator = checkpointCoordinator;
-            this.operatorParallelism = operatorParallelism;
+            final Throwable failure;
+            synchronized (this) {
+                this.globalFailureHandler = checkNotNull(globalFailureHandler);
+                this.schedulerExecutor = checkNotNull(schedulerExecutor);
+                this.checkpointCoordinator = checkpointCoordinator;
+                this.operatorParallelism = operatorParallelism;
+                failure = failureBeforeInitialization;
+                failureBeforeInitialization = null;
+            }
+            if (failure != null) {
+                failJob(failure);
+            }
         }
 
         void unInitialize() {
@@ -645,6 +690,10 @@ public class OperatorCoordinatorHolder
 
         void resetFailed() {
             failed = false;
+            synchronized (this) {
+                // a failure of a superseded restore must not fail the job later
+                failureBeforeInitialization = null;
+            }
         }
 
         @Override
@@ -669,7 +718,14 @@ public class OperatorCoordinatorHolder
 
         @Override
         public void failJob(final Throwable cause) {
-            checkInitialized();
+            synchronized (this) {
+                if (!isInitialized()) {
+                    if (failureBeforeInitialization == null) {
+                        failureBeforeInitialization = cause;
+                    }
+                    return;
+                }
+            }
 
             final FlinkException e =
                     new FlinkException(

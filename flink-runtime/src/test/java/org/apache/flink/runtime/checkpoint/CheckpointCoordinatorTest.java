@@ -2952,6 +2952,90 @@ class CheckpointCoordinatorTest {
     }
 
     @Test
+    void testRestoreHandsCoordinatorStateStoredInAFileToTheCoordinator() throws Exception {
+        final OperatorID operatorId = new OperatorID();
+        final List<StreamStateHandle> restoredStates = new ArrayList<>();
+        final OperatorCoordinatorCheckpointContext coordinatorContext =
+                new OperatorCoordinatorCheckpointContext() {
+                    @Override
+                    public void checkpointCoordinator(
+                            long checkpointId, CompletableFuture<byte[]> result) {}
+
+                    @Override
+                    public void abortCurrentTriggering() {}
+
+                    @Override
+                    public void notifyCheckpointComplete(long checkpointId) {}
+
+                    @Override
+                    public void resetToCheckpoint(long checkpointId, byte[] checkpointData) {
+                        throw new UnsupportedOperationException();
+                    }
+
+                    @Override
+                    public boolean supportsCoordinatorStateInFile() {
+                        return true;
+                    }
+
+                    @Override
+                    public void resetToCheckpointFromHandle(
+                            long checkpointId, StreamStateHandle checkpointState) {
+                        restoredStates.add(checkpointState);
+                    }
+
+                    @Override
+                    public void subtaskReset(int subtask, long checkpointId) {}
+
+                    @Override
+                    public OperatorID operatorId() {
+                        return operatorId;
+                    }
+
+                    @Override
+                    public int maxParallelism() {
+                        return 1;
+                    }
+
+                    @Override
+                    public int currentParallelism() {
+                        return 1;
+                    }
+                };
+        final FileStateHandle file =
+                new FileStateHandle(new Path("file:///coordinator-state"), 4096);
+        final OperatorState operatorState = new OperatorState(null, null, operatorId, 1, 1);
+        operatorState.setCoordinatorState(file);
+        final StandaloneCompletedCheckpointStore store = new StandaloneCompletedCheckpointStore(1);
+        store.addCheckpointAndSubsumeOldestOne(
+                new CompletedCheckpoint(
+                        new JobID(),
+                        42,
+                        0,
+                        0,
+                        Collections.singletonMap(operatorId, operatorState),
+                        Collections.emptyList(),
+                        CheckpointProperties.forCheckpoint(
+                                CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION),
+                        new TestCompletedCheckpointStorageLocation(),
+                        null),
+                new CheckpointsCleaner(),
+                () -> {});
+        final CheckpointCoordinator checkpointCoordinator =
+                new CheckpointCoordinatorBuilder()
+                        .setCompletedCheckpointStore(store)
+                        .setTimer(manuallyTriggeredScheduledExecutor)
+                        .setCoordinatorsToCheckpoint(Collections.singleton(coordinatorContext))
+                        .build(EXECUTOR_RESOURCE.getExecutor());
+
+        assertThat(
+                        checkpointCoordinator.restoreLatestCheckpointedStateToAll(
+                                Collections.emptySet(), true))
+                .isTrue();
+
+        assertThat(restoredStates).containsExactly(file);
+    }
+
+    @Test
     void testSharedStateRegistrationOnRestore() throws Exception {
         for (RecoveryClaimMode recoveryClaimMode : RecoveryClaimMode.values()) {
             JobVertexID jobVertexID1 = new JobVertexID();

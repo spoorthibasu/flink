@@ -27,6 +27,7 @@ import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.messages.Acknowledge;
+import org.apache.flink.runtime.state.StreamStateHandle;
 
 import javax.annotation.Nullable;
 
@@ -202,6 +203,32 @@ public interface OperatorCoordinator extends CheckpointListener, AutoCloseable {
      * checkpoint, before calling the {@link #notifyCheckpointComplete(long)} method).
      */
     void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData) throws Exception;
+
+    /**
+     * Whether the coordinator can restore its state from a state handle without blocking the
+     * caller, through {@link #resetToCheckpointFromHandle(long, StreamStateHandle)}. If it returns
+     * true, its state may be stored in its own file rather than inline in the checkpoint metadata,
+     * and the JobManager does not keep a copy of it in memory.
+     */
+    default boolean supportsCoordinatorStateInFile() {
+        return false;
+    }
+
+    /**
+     * Resets the coordinator to the checkpoint whose state has to be read from the given handle,
+     * for example because it is stored in its own file. Called only if {@link
+     * #supportsCoordinatorStateInFile()} returns true, instead of {@link #resetToCheckpoint(long,
+     * byte[])}, and with the same semantics.
+     *
+     * <p>This method is called on the JobManager main thread and must not block on reading the
+     * state.
+     */
+    default void resetToCheckpointFromHandle(long checkpointId, StreamStateHandle checkpointState)
+            throws Exception {
+        throw new UnsupportedOperationException(
+                "Override supportsCoordinatorStateInFile() and this method to restore state that is"
+                        + " stored in a file.");
+    }
 
     // ------------------------------------------------------------------------
 

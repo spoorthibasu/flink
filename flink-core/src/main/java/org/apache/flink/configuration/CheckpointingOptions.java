@@ -248,6 +248,23 @@ public class CheckpointingOptions {
                             "state.backend.fs.memory-threshold");
 
     /**
+     * Whether large operator coordinator state is stored in its own file rather than inline in the
+     * root checkpoint metadata file.
+     */
+    @Documentation.Section(Documentation.Sections.EXPERT_CHECKPOINTING)
+    public static final ConfigOption<Boolean> COORDINATOR_STATE_IN_FILE =
+            ConfigOptions.key("execution.checkpointing.coordinator-state-in-file.enabled")
+                    .booleanType()
+                    .defaultValue(true)
+                    .withDescription(
+                            "Whether operator coordinator state larger than 'execution.checkpointing.data-inline-threshold'"
+                                    + " is stored in its own file instead of inline in the root checkpoint metadata file."
+                                    + " This applies to coordinators that can restore their state from a file, which"
+                                    + " includes the coordinators of all sources built on the Source API. Checkpoints"
+                                    + " with coordinator state in a file use metadata version 7, which earlier Flink"
+                                    + " versions cannot restore. Disable this to keep new checkpoints restorable by them.");
+
+    /**
      * The default size of the write buffer for the checkpoint streams that write to file systems.
      */
     @Documentation.Section(Documentation.Sections.EXPERT_CHECKPOINTING)

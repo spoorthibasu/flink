@@ -21,6 +21,8 @@ package org.apache.flink.runtime.operators.coordination;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobInfoImpl;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.core.fs.Path;
+import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.core.testutils.OneShotLatch;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
 import org.apache.flink.runtime.checkpoint.CheckpointFailureManager;
@@ -42,22 +44,31 @@ import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 import org.apache.flink.runtime.operators.coordination.EventReceivingTasks.EventWithSubtask;
 import org.apache.flink.runtime.scheduler.GlobalFailureHandler;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.runtime.state.filesystem.FileStateHandle;
+import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.runtime.state.storage.JobManagerCheckpointStorage;
 import org.apache.flink.runtime.testtasks.NoOpInvokable;
+import org.apache.flink.runtime.testutils.DirectScheduledExecutorService;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.concurrent.ScheduledExecutor;
 
 import org.apache.commons.collections.iterators.IteratorChain;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Queue;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
@@ -68,6 +79,7 @@ import java.util.function.Function;
 
 import static org.apache.flink.core.testutils.FlinkAssertions.assertThatFuture;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A test that ensures the before/after conditions around event sending and checkpoint are met.
@@ -76,7 +88,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class OperatorCoordinatorHolderTest {
 
     private final GlobalFailureHandler globalFailureHandler = (t) -> globalFailure = t;
-    private Throwable globalFailure;
+    private volatile Throwable globalFailure;
 
     @AfterEach
     void checkNoGlobalFailure() throws Exception {
@@ -164,6 +176,194 @@ class OperatorCoordinatorHolderTest {
         holder.handleEventFromOperator(0, 0, new AcknowledgeCheckpointEvent(1111L));
 
         assertThat(tasks.getSentEventsForSubtask(0)).containsExactly(new TestOperatorEvent(1337));
+    }
+
+    @Test
+    void coordinatorStateInFileIsSupportedByCoordinatorsThatRecreateOnReset() throws Exception {
+        final EventReceivingTasks tasks = EventReceivingTasks.createForRunningTasks();
+
+        assertThat(
+                        createCoordinatorHolder(tasks, TestingOperatorCoordinator::new)
+                                .supportsCoordinatorStateInFile())
+                .isFalse();
+        assertThat(
+                        createCoordinatorHolder(
+                                        tasks, OperatorCoordinatorHolderTest::recreateOnReset)
+                                .supportsCoordinatorStateInFile())
+                .isTrue();
+    }
+
+    @Test
+    void restoreFromInMemoryStateHandlePassesTheBytes() throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        TestingOperatorCoordinator::new);
+
+        holder.resetToCheckpointFromHandle(
+                1L, new ByteStreamStateHandle("coordinator-state", new byte[] {1, 2, 3}));
+
+        assertThat(getCoordinator(holder).getLastRestoredCheckpointState())
+                .containsExactly(1, 2, 3);
+    }
+
+    @Test
+    void restoreFromFileIsReadByCoordinatorsThatRecreateOnReset(@TempDir java.nio.file.Path tmp)
+            throws Exception {
+        final byte[] bytes = new byte[4096];
+        new Random().nextBytes(bytes);
+        final java.nio.file.Path file = tmp.resolve("coordinator-state");
+        Files.write(file, bytes);
+        final OperatorCoordinatorHolder holder =
+                createCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        OperatorCoordinatorHolderTest::recreateOnReset);
+
+        holder.resetToCheckpointFromHandle(
+                1L, new FileStateHandle(new Path(file.toUri()), bytes.length));
+
+        final TestingOperatorCoordinator restored =
+                (TestingOperatorCoordinator)
+                        ((RecreateOnResetOperatorCoordinator) holder.coordinator())
+                                .getInternalCoordinator();
+        assertThat(restored.getLastRestoredCheckpointState()).isEqualTo(bytes);
+    }
+
+    @Test
+    void restoreFromInMemoryStateHandlePassesTheBytesToCoordinatorsThatRecreateOnReset()
+            throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        OperatorCoordinatorHolderTest::recreateOnReset);
+
+        holder.resetToCheckpointFromHandle(
+                1L, new ByteStreamStateHandle("coordinator-state", new byte[] {1, 2, 3}));
+
+        final TestingOperatorCoordinator restored =
+                (TestingOperatorCoordinator)
+                        ((RecreateOnResetOperatorCoordinator) holder.coordinator())
+                                .getInternalCoordinator();
+        assertThat(restored.getLastRestoredCheckpointState()).containsExactly(1, 2, 3);
+    }
+
+    @Test
+    void restoreFromFileGoesToAnyCoordinatorThatSupportsIt() throws Exception {
+        final List<StreamStateHandle> restored = new ArrayList<>();
+        final OperatorCoordinatorHolder holder =
+                createCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        context ->
+                                new TestingOperatorCoordinator(context) {
+                                    @Override
+                                    public boolean supportsCoordinatorStateInFile() {
+                                        return true;
+                                    }
+
+                                    @Override
+                                    public void resetToCheckpointFromHandle(
+                                            long checkpointId, StreamStateHandle checkpointState) {
+                                        restored.add(checkpointState);
+                                    }
+                                });
+        final FileStateHandle file =
+                new FileStateHandle(new Path("file:///coordinator-state"), 4096);
+
+        holder.resetToCheckpointFromHandle(1L, file);
+
+        assertThat(holder.supportsCoordinatorStateInFile()).isTrue();
+        assertThat(restored).containsExactly(file);
+    }
+
+    @Test
+    void restoreFromFileFailsForCoordinatorsThatOnlyRestoreFromMemory() throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        TestingOperatorCoordinator::new);
+
+        assertThatThrownBy(
+                        () ->
+                                holder.resetToCheckpointFromHandle(
+                                        1L,
+                                        new FileStateHandle(
+                                                new Path("file:///coordinator-state"), 4096)))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("can only restore state held in memory");
+    }
+
+    @Test
+    void coordinatorFailureBeforeInitializationFailsTheJobOnceInitialized() throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        context ->
+                                new TestingOperatorCoordinator(context) {
+                                    @Override
+                                    public void resetToCheckpoint(
+                                            long checkpointId, @Nullable byte[] checkpointData) {
+                                        context.failJob(new Exception("Cannot restore"));
+                                    }
+                                });
+
+        // like the initial restore, which happens before the scheduler initializes the holder
+        holder.resetToCheckpoint(1L, new byte[0]);
+        assertThat(globalFailure).isNull();
+
+        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
+
+        assertThat(globalFailure).hasRootCauseMessage("Cannot restore");
+        globalFailure = null;
+    }
+
+    @Test
+    void failureOfSupersededRestoreBeforeInitializationDoesNotFailTheJob() throws Exception {
+        final boolean[] failNextRestore = {true};
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        context ->
+                                new TestingOperatorCoordinator(context) {
+                                    @Override
+                                    public void resetToCheckpoint(
+                                            long checkpointId, @Nullable byte[] checkpointData) {
+                                        if (failNextRestore[0]) {
+                                            failNextRestore[0] = false;
+                                            context.failJob(new Exception("Cannot restore"));
+                                        }
+                                    }
+                                });
+
+        holder.resetToCheckpoint(1L, new byte[0]);
+        holder.resetToCheckpoint(2L, new byte[0]);
+        initializeAndStart(holder, ComponentMainThreadExecutorServiceAdapter.forMainThread());
+
+        assertThat(globalFailure).isNull();
+    }
+
+    @Test
+    void failureToReadStateBeforeInitializationFailsTheJob(@TempDir java.nio.file.Path tmp)
+            throws Exception {
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(
+                        EventReceivingTasks.createForRunningTasks(),
+                        OperatorCoordinatorHolderTest::recreateOnReset);
+
+        holder.resetToCheckpointFromHandle(
+                1L, new FileStateHandle(new Path(tmp.resolve("absent").toUri()), 4096));
+        // like the scheduler's executor, accepts the failure from the thread that read the state
+        initializeAndStart(
+                holder,
+                new ComponentMainThreadExecutorServiceAdapter(
+                        new DirectScheduledExecutorService(), Thread.currentThread()));
+
+        CommonTestUtils.waitUtil(
+                () -> globalFailure != null,
+                Duration.ofSeconds(10),
+                "The job should fail because the coordinator state cannot be read.");
+        assertThat(globalFailure)
+                .hasStackTraceContaining("Could not read the coordinator state of checkpoint 1");
+        globalFailure = null;
     }
 
     @Test
@@ -489,6 +689,22 @@ class OperatorCoordinatorHolderTest {
         return ByteBuffer.wrap(bytes).getInt();
     }
 
+    private static OperatorCoordinator recreateOnReset(OperatorCoordinator.Context context) {
+        final RecreateOnResetOperatorCoordinator.Provider provider =
+                new RecreateOnResetOperatorCoordinator.Provider(context.getOperatorId()) {
+                    @Override
+                    protected OperatorCoordinator getCoordinator(
+                            OperatorCoordinator.Context context) {
+                        return new TestingOperatorCoordinator(context);
+                    }
+                };
+        try {
+            return provider.create(context);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static TestingOperatorCoordinator getCoordinator(OperatorCoordinatorHolder holder) {
         return (TestingOperatorCoordinator) holder.coordinator();
     }
@@ -508,6 +724,17 @@ class OperatorCoordinatorHolderTest {
             final SubtaskAccess.SubtaskAccessFactory eventTarget,
             final Function<OperatorCoordinator.Context, OperatorCoordinator> coordinatorCtor,
             final ComponentMainThreadExecutor mainThreadExecutor)
+            throws Exception {
+
+        final OperatorCoordinatorHolder holder =
+                createUninitializedCoordinatorHolder(eventTarget, coordinatorCtor);
+        initializeAndStart(holder, mainThreadExecutor);
+        return holder;
+    }
+
+    private OperatorCoordinatorHolder createUninitializedCoordinatorHolder(
+            final SubtaskAccess.SubtaskAccessFactory eventTarget,
+            final Function<OperatorCoordinator.Context, OperatorCoordinator> coordinatorCtor)
             throws Exception {
 
         final OperatorID opId = new OperatorID();
@@ -544,7 +771,12 @@ class OperatorCoordinatorHolderTest {
                                 new Configuration()),
                         new JobInfoImpl(new JobID(), "test-job"),
                         UnregisteredMetricGroups.createUnregisteredJobManagerJobMetricGroup());
+        return holder;
+    }
 
+    private void initializeAndStart(
+            OperatorCoordinatorHolder holder, ComponentMainThreadExecutor mainThreadExecutor)
+            throws Exception {
         JobID jobId = new JobID();
         holder.lazyInitialize(
                 globalFailureHandler,
@@ -577,8 +809,6 @@ class OperatorCoordinatorHolderTest {
                                 false),
                         NoOpCheckpointStatsTracker.INSTANCE));
         holder.start();
-
-        return holder;
     }
 
     private static class ReorderableManualExecutorService

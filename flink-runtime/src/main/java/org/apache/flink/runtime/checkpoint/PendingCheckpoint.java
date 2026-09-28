@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.checkpoint;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.runtime.OperatorIDPair;
 import org.apache.flink.runtime.checkpoint.metadata.CheckpointMetadata;
@@ -27,10 +28,14 @@ import org.apache.flink.runtime.executiongraph.ExecutionVertex;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.OperatorInfo;
 import org.apache.flink.runtime.state.CheckpointMetadataOutputStream;
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
 import org.apache.flink.runtime.state.CheckpointStorageLocation;
+import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.CompletedCheckpointStorageLocation;
 import org.apache.flink.runtime.state.StateObject;
 import org.apache.flink.runtime.state.StateUtil;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.runtime.state.filesystem.FsCheckpointStreamFactory;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.ExceptionUtils;
@@ -101,6 +106,9 @@ public class PendingCheckpoint implements Checkpoint {
     private final Map<ExecutionAttemptID, ExecutionVertex> notYetAcknowledgedTasks;
 
     private final Set<OperatorID> notYetAcknowledgedOperatorCoordinators;
+
+    /** Operators whose coordinators can restore coordinator state stored in its own file. */
+    private final Set<OperatorID> coordinatorStatesThatMayBeStoredInFiles = new HashSet<>();
 
     private final List<MasterState> masterStates;
 
@@ -328,6 +336,8 @@ public class PendingCheckpoint implements Checkpoint {
             try {
                 checkpointPlan.fulfillFinishedTaskStatus(operatorStates);
 
+                offloadCoordinatorStates();
+
                 // write out the metadata
                 final CheckpointMetadata savepoint =
                         new CheckpointMetadata(
@@ -360,6 +370,45 @@ public class PendingCheckpoint implements Checkpoint {
                 onCompletionPromise.completeExceptionally(t);
                 ExceptionUtils.rethrowIOException(t);
                 return null; // silence the compiler
+            }
+        }
+    }
+
+    /**
+     * Writes the state of coordinators that can restore it from a file through this checkpoint's
+     * storage location, the way subtask state is written. State below the storage's inline
+     * threshold comes back as the same in-memory handle and stays inline in the metadata; larger
+     * state is written to its own file, the metadata only references it, and the bytes are not kept
+     * in memory. The state of other coordinators stays inline.
+     */
+    private void offloadCoordinatorStates() throws IOException {
+        // Only file system storage can put state in its own file. Memory-backed storage caps every
+        // state at its maximum state size and would hand the bytes back in memory anyway, and
+        // coordinator state has never been subject to that cap, so it stays inline there.
+        if (!(targetLocation instanceof FsCheckpointStreamFactory)) {
+            return;
+        }
+        for (OperatorState operatorState : operatorStates.values()) {
+            final StreamStateHandle state = operatorState.getCoordinatorState();
+            if (!(state instanceof ByteStreamStateHandle)
+                    || !coordinatorStatesThatMayBeStoredInFiles.contains(
+                            operatorState.getOperatorID())) {
+                continue;
+            }
+            final byte[] data = ((ByteStreamStateHandle) state).getData();
+            final StreamStateHandle persisted;
+            try (CheckpointStateOutputStream out =
+                    targetLocation.createCheckpointStateOutputStream(
+                            CheckpointedStateScope.EXCLUSIVE)) {
+                out.write(data);
+                persisted = out.closeAndGetHandle();
+            }
+            if (persisted != null && !(persisted instanceof ByteStreamStateHandle)) {
+                operatorState.offloadCoordinatorState(persisted);
+                // not part of the metadata size, so count it in the state size
+                if (pendingCheckpointStats != null) {
+                    pendingCheckpointStats.reportCoordinatorStateSize(data.length);
+                }
             }
         }
     }
@@ -491,8 +540,21 @@ public class PendingCheckpoint implements Checkpoint {
         }
     }
 
+    @VisibleForTesting
     public TaskAcknowledgeResult acknowledgeCoordinatorState(
             OperatorInfo coordinatorInfo, @Nullable ByteStreamStateHandle stateHandle) {
+        return acknowledgeCoordinatorState(coordinatorInfo, stateHandle, false);
+    }
+
+    /**
+     * Acknowledges the coordinator state. If the coordinator supports it, state above the
+     * checkpoint storage's inline threshold is stored in its own file when the checkpoint is
+     * finalized.
+     */
+    public TaskAcknowledgeResult acknowledgeCoordinatorState(
+            OperatorInfo coordinatorInfo,
+            @Nullable ByteStreamStateHandle stateHandle,
+            boolean supportsStateInFile) {
 
         synchronized (lock) {
             if (disposed) {
@@ -521,6 +583,9 @@ public class PendingCheckpoint implements Checkpoint {
             }
             if (stateHandle != null) {
                 operatorState.setCoordinatorState(stateHandle);
+                if (supportsStateInFile) {
+                    coordinatorStatesThatMayBeStoredInFiles.add(operatorId);
+                }
             }
 
             return TaskAcknowledgeResult.SUCCESS;

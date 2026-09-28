@@ -21,9 +21,12 @@ package org.apache.flink.runtime.operators.coordination;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobInfo;
+import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.metrics.groups.OperatorCoordinatorMetricGroup;
 import org.apache.flink.runtime.checkpoint.CheckpointCoordinator;
 import org.apache.flink.runtime.jobgraph.OperatorID;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.MdcUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.function.ThrowingConsumer;
@@ -128,6 +131,27 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
 
     @Override
     public void resetToCheckpoint(final long checkpointId, @Nullable final byte[] checkpointData) {
+        resetToCheckpoint(checkpointId, CompletableFuture.completedFuture(checkpointData));
+    }
+
+    @Override
+    public boolean supportsCoordinatorStateInFile() {
+        return true;
+    }
+
+    /**
+     * Reads the state in a separate thread, so this method does not block on I/O. The new
+     * coordinator is created and reset once the state has been read and the old coordinator has
+     * closed; until then, calls are deferred as for any reset.
+     */
+    @Override
+    public void resetToCheckpointFromHandle(
+            final long checkpointId, final StreamStateHandle checkpointState) {
+        resetToCheckpoint(checkpointId, readInSeparateThread(checkpointState));
+    }
+
+    private void resetToCheckpoint(
+            final long checkpointId, final CompletableFuture<byte[]> checkpointData) {
         // First bump up the coordinator epoch to fence out the active coordinator.
         LOG.info("Resetting coordinator to checkpoint.");
         // Replace the coordinator variable with a new DeferrableCoordinator instance.
@@ -145,23 +169,59 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
         // capture the status whether the coordinator was started when this method was called
         final boolean wasStarted = this.started;
 
-        closingFuture.whenComplete(
-                (ignored, e) -> {
-                    if (e != null) {
-                        LOG.warn(
-                                String.format(
-                                        "Received exception when closing "
-                                                + "operator coordinator for %s.",
-                                        oldCoordinator.operatorId),
-                                e);
-                    }
-                    if (!closed) {
-                        // The previous coordinator has closed. Create a new one.
-                        newCoordinator.createNewInternalCoordinator(context, provider);
-                        newCoordinator.resetAndStart(checkpointId, checkpointData, wasStarted);
-                        newCoordinator.processPendingCalls();
-                    }
-                });
+        closingFuture
+                .handle(
+                        (ignored, e) -> {
+                            if (e != null) {
+                                LOG.warn(
+                                        String.format(
+                                                "Received exception when closing "
+                                                        + "operator coordinator for %s.",
+                                                oldCoordinator.operatorId),
+                                        e);
+                            }
+                            return null;
+                        })
+                .thenCombine(checkpointData, (ignored, data) -> data)
+                .whenComplete(
+                        (data, e) -> {
+                            if (!closed) {
+                                // The previous coordinator has closed. Create a new one.
+                                newCoordinator.createNewInternalCoordinator(context, provider);
+                                if (e != null) {
+                                    newCoordinator.failToReadState(checkpointId, e);
+                                    return;
+                                }
+                                newCoordinator.resetAndStart(checkpointId, data, wasStarted);
+                                newCoordinator.processPendingCalls();
+                            }
+                        })
+                .exceptionally(
+                        t -> {
+                            LOG.error(
+                                    "Failed to reset the coordinator to checkpoint {}.",
+                                    checkpointId,
+                                    t);
+                            return null;
+                        });
+    }
+
+    private CompletableFuture<byte[]> readInSeparateThread(StreamStateHandle checkpointState) {
+        final CompletableFuture<byte[]> checkpointData = new CompletableFuture<>();
+        final Thread reader =
+                new Thread(
+                        () -> {
+                            // read to the end rather than trusting the recorded size, which may
+                            // be unknown
+                            try (FSDataInputStream in = checkpointState.openInputStream()) {
+                                checkpointData.complete(in.readAllBytes());
+                            } catch (Throwable t) {
+                                checkpointData.completeExceptionally(t);
+                            }
+                        },
+                        "Coordinator state reader for " + context.getOperatorId());
+        reader.start();
+        return checkpointData;
     }
 
     @Override
@@ -454,6 +514,22 @@ public class RecreateOnResetOperatorCoordinator implements OperatorCoordinator {
                 LOG.error("Failed to reset the coordinator to checkpoint and start.", e);
                 cleanAndFailJob(e);
             }
+        }
+
+        /**
+         * Fails the job because the state to reset to could not be read, unless this coordinator
+         * has already been replaced by a later reset.
+         */
+        synchronized void failToReadState(long checkpointId, Throwable t) {
+            if (closed || internalCoordinator == null) {
+                return;
+            }
+            cleanAndFailJob(
+                    new FlinkException(
+                            String.format(
+                                    "Could not read the coordinator state of checkpoint %d.",
+                                    checkpointId),
+                            t));
         }
 
         private void cleanAndFailJob(Throwable t) {

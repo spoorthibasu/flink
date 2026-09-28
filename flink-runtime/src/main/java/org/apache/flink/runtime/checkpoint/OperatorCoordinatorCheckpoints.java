@@ -42,8 +42,14 @@ import java.util.concurrent.Executor;
  */
 final class OperatorCoordinatorCheckpoints {
 
+    /**
+     * Triggers the coordinator's checkpoint. Its state may be stored in its own file if that is
+     * enabled and the coordinator supports it.
+     */
     public static CompletableFuture<CoordinatorSnapshot> triggerCoordinatorCheckpoint(
-            final OperatorCoordinatorCheckpointContext coordinatorContext, final long checkpointId)
+            final OperatorCoordinatorCheckpointContext coordinatorContext,
+            final long checkpointId,
+            final boolean stateInFileEnabled)
             throws Exception {
 
         final CompletableFuture<byte[]> checkpointFuture = new CompletableFuture<>();
@@ -54,12 +60,15 @@ final class OperatorCoordinatorCheckpoints {
                         new CoordinatorSnapshot(
                                 coordinatorContext,
                                 new ByteStreamStateHandle(
-                                        coordinatorContext.operatorId().toString(), state)));
+                                        coordinatorContext.operatorId().toString(), state),
+                                stateInFileEnabled
+                                        && coordinatorContext.supportsCoordinatorStateInFile()));
     }
 
     public static CompletableFuture<AllCoordinatorSnapshots> triggerAllCoordinatorCheckpoints(
             final Collection<OperatorCoordinatorCheckpointContext> coordinators,
-            final long checkpointId)
+            final long checkpointId,
+            final boolean stateInFileEnabled)
             throws Exception {
 
         final Collection<CompletableFuture<CoordinatorSnapshot>> individualSnapshots =
@@ -67,7 +76,7 @@ final class OperatorCoordinatorCheckpoints {
 
         for (final OperatorCoordinatorCheckpointContext coordinator : coordinators) {
             final CompletableFuture<CoordinatorSnapshot> checkpointFuture =
-                    triggerCoordinatorCheckpoint(coordinator, checkpointId);
+                    triggerCoordinatorCheckpoint(coordinator, checkpointId, stateInFileEnabled);
             individualSnapshots.add(checkpointFuture);
         }
 
@@ -77,11 +86,13 @@ final class OperatorCoordinatorCheckpoints {
     public static CompletableFuture<Void> triggerAndAcknowledgeAllCoordinatorCheckpoints(
             final Collection<OperatorCoordinatorCheckpointContext> coordinators,
             final PendingCheckpoint checkpoint,
-            final Executor acknowledgeExecutor)
+            final Executor acknowledgeExecutor,
+            final boolean stateInFileEnabled)
             throws Exception {
 
         final CompletableFuture<AllCoordinatorSnapshots> snapshots =
-                triggerAllCoordinatorCheckpoints(coordinators, checkpoint.getCheckpointID());
+                triggerAllCoordinatorCheckpoints(
+                        coordinators, checkpoint.getCheckpointID(), stateInFileEnabled);
 
         return snapshots.thenAcceptAsync(
                 (allSnapshots) -> {
@@ -98,12 +109,13 @@ final class OperatorCoordinatorCheckpoints {
             triggerAndAcknowledgeAllCoordinatorCheckpointsWithCompletion(
                     final Collection<OperatorCoordinatorCheckpointContext> coordinators,
                     final PendingCheckpoint checkpoint,
-                    final Executor acknowledgeExecutor)
+                    final Executor acknowledgeExecutor,
+                    final boolean stateInFileEnabled)
                     throws CompletionException {
 
         try {
             return triggerAndAcknowledgeAllCoordinatorCheckpoints(
-                    coordinators, checkpoint, acknowledgeExecutor);
+                    coordinators, checkpoint, acknowledgeExecutor, stateInFileEnabled);
         } catch (Exception e) {
             throw new CompletionException(e);
         }
@@ -116,7 +128,8 @@ final class OperatorCoordinatorCheckpoints {
             throws CheckpointException {
         for (final CoordinatorSnapshot snapshot : snapshots) {
             final PendingCheckpoint.TaskAcknowledgeResult result =
-                    checkpoint.acknowledgeCoordinatorState(snapshot.coordinator, snapshot.state);
+                    checkpoint.acknowledgeCoordinatorState(
+                            snapshot.coordinator, snapshot.state, snapshot.supportsStateInFile);
 
             if (result != PendingCheckpoint.TaskAcknowledgeResult.SUCCESS) {
                 final String errorMessage =
@@ -159,10 +172,15 @@ final class OperatorCoordinatorCheckpoints {
 
         final OperatorInfo coordinator;
         final ByteStreamStateHandle state;
+        final boolean supportsStateInFile;
 
-        CoordinatorSnapshot(OperatorInfo coordinator, ByteStreamStateHandle state) {
+        CoordinatorSnapshot(
+                OperatorInfo coordinator,
+                ByteStreamStateHandle state,
+                boolean supportsStateInFile) {
             this.coordinator = coordinator;
             this.state = state;
+            this.supportsStateInFile = supportsStateInFile;
         }
     }
 }

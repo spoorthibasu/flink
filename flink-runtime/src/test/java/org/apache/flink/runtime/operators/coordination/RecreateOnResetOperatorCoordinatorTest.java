@@ -18,16 +18,29 @@ limitations under the License.
 
 package org.apache.flink.runtime.operators.coordination;
 
+import org.apache.flink.core.fs.FSDataInputStream;
+import org.apache.flink.core.fs.Path;
 import org.apache.flink.core.testutils.CommonTestUtils;
 import org.apache.flink.runtime.jobgraph.OperatorID;
+import org.apache.flink.runtime.state.PhysicalStateHandleID;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.runtime.state.filesystem.FileStateHandle;
+import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 
@@ -103,6 +116,92 @@ class RecreateOnResetOperatorCoordinatorTest {
         assertThat(internalCoordinatorAfterReset.getLastRestoredCheckpointState())
                 .isEqualTo(stateToRestore);
         assertThat(internalCoordinatorBeforeReset).isNotEqualTo(internalCoordinatorAfterReset);
+    }
+
+    @Test
+    @Timeout(60)
+    void testResetToCheckpointReadsStateFromHandleInSeparateThread(@TempDir java.nio.file.Path tmp)
+            throws Exception {
+        final byte[] stateToRestore = new byte[4096];
+        new Random().nextBytes(stateToRestore);
+        final java.nio.file.Path file = tmp.resolve("coordinator-state");
+        Files.write(file, stateToRestore);
+        // the recorded size may be unknown
+        final ThreadRecordingStateHandle handle =
+                new ThreadRecordingStateHandle(new FileStateHandle(new Path(file.toUri()), -1));
+        final RecreateOnResetOperatorCoordinator coordinator =
+                createCoordinator(
+                        new TestingCoordinatorProvider(null),
+                        new MockOperatorCoordinatorContext(OPERATOR_ID, NUM_SUBTASKS));
+
+        coordinator.resetToCheckpointFromHandle(1L, handle);
+
+        assertThat(getInternalCoordinator(coordinator).getLastRestoredCheckpointState())
+                .isEqualTo(stateToRestore);
+        assertThat(handle.readingThread).isNotNull().isNotSameAs(Thread.currentThread());
+    }
+
+    @Test
+    @Timeout(60)
+    void testResetToCheckpointFailsJobIfStateCannotBeRead(@TempDir java.nio.file.Path tmp)
+            throws Exception {
+        final MockOperatorCoordinatorContext context =
+                new MockOperatorCoordinatorContext(OPERATOR_ID, NUM_SUBTASKS);
+        final RecreateOnResetOperatorCoordinator coordinator =
+                createCoordinator(new TestingCoordinatorProvider(null), context);
+
+        coordinator.resetToCheckpointFromHandle(
+                1L, new FileStateHandle(new Path(tmp.resolve("absent").toUri()), 4096));
+
+        CommonTestUtils.waitUtil(
+                context::isJobFailed,
+                Duration.ofSeconds(10),
+                "The job should fail because the coordinator state cannot be read.");
+        assertThat(context.getJobFailureReason())
+                .hasMessageContaining("Could not read the coordinator state of checkpoint 1");
+    }
+
+    @Test
+    @Timeout(60)
+    void testResetToCheckpointDoesNotWaitForTheStateToBeRead() throws Exception {
+        final RecreateOnResetOperatorCoordinator coordinator =
+                createCoordinator(
+                        new TestingCoordinatorProvider(null),
+                        new MockOperatorCoordinatorContext(OPERATOR_ID, NUM_SUBTASKS));
+        final BlockingStateHandle slowState = new BlockingStateHandle(new byte[] {7}, false);
+
+        coordinator.resetToCheckpointFromHandle(1L, slowState);
+        CommonTestUtils.waitUtil(
+                () -> slowState.readingThread != null,
+                Duration.ofSeconds(10),
+                "The state should be read.");
+        assertThat(slowState.readingThread).isNotSameAs(Thread.currentThread());
+        slowState.release();
+
+        assertThat(getInternalCoordinator(coordinator).getLastRestoredCheckpointState())
+                .containsExactly(7);
+    }
+
+    @Timeout(60)
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void testLaterResetWinsOverEarlierResetStillReadingItsState(boolean earlierReadFails)
+            throws Exception {
+        final MockOperatorCoordinatorContext context =
+                new MockOperatorCoordinatorContext(OPERATOR_ID, NUM_SUBTASKS);
+        final RecreateOnResetOperatorCoordinator coordinator =
+                createCoordinator(new TestingCoordinatorProvider(null), context);
+        final BlockingStateHandle slowState =
+                new BlockingStateHandle(new byte[] {1}, earlierReadFails);
+
+        coordinator.resetToCheckpointFromHandle(1L, slowState);
+        coordinator.resetToCheckpoint(2L, new byte[] {2});
+        final TestingOperatorCoordinator afterLaterReset = getInternalCoordinator(coordinator);
+        slowState.release();
+
+        assertThat(afterLaterReset.getLastRestoredCheckpointState()).containsExactly(2);
+        assertThat(getInternalCoordinator(coordinator)).isSameAs(afterLaterReset);
+        assertThat(context.isJobFailed()).isFalse();
     }
 
     @Test
@@ -323,6 +422,100 @@ class RecreateOnResetOperatorCoordinatorTest {
 
         private List<TestingOperatorCoordinator> getCreatedCoordinators() {
             return createdCoordinators;
+        }
+    }
+
+    /** State whose read blocks until released, then returns the given bytes or fails. */
+    private static class BlockingStateHandle implements StreamStateHandle {
+        private static final long serialVersionUID = 1L;
+        private final byte[] bytes;
+        private final boolean fail;
+        private final CountDownLatch released = new CountDownLatch(1);
+        private volatile Thread readingThread;
+
+        private BlockingStateHandle(byte[] bytes, boolean fail) {
+            this.bytes = bytes;
+            this.fail = fail;
+        }
+
+        /** Lets the read finish and waits until the thread that read has completed the reset. */
+        private void release() throws Exception {
+            CommonTestUtils.waitUtil(
+                    () -> readingThread != null,
+                    Duration.ofSeconds(10),
+                    "The state should be read.");
+            released.countDown();
+            readingThread.join();
+        }
+
+        @Override
+        public FSDataInputStream openInputStream() throws IOException {
+            readingThread = Thread.currentThread();
+            try {
+                released.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+            if (fail) {
+                throw new IOException("Expected test failure");
+            }
+            return new ByteStreamStateHandle("state", bytes).openInputStream();
+        }
+
+        @Override
+        public Optional<byte[]> asBytesIfInMemory() {
+            return Optional.empty();
+        }
+
+        @Override
+        public PhysicalStateHandleID getStreamStateHandleID() {
+            return new PhysicalStateHandleID("blocking");
+        }
+
+        @Override
+        public void discardState() {}
+
+        @Override
+        public long getStateSize() {
+            return bytes.length;
+        }
+    }
+
+    /** Records the thread that reads the state. */
+    private static class ThreadRecordingStateHandle implements StreamStateHandle {
+        private static final long serialVersionUID = 1L;
+        private final StreamStateHandle delegate;
+        private volatile Thread readingThread;
+
+        private ThreadRecordingStateHandle(StreamStateHandle delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public FSDataInputStream openInputStream() throws IOException {
+            readingThread = Thread.currentThread();
+            return delegate.openInputStream();
+        }
+
+        @Override
+        public Optional<byte[]> asBytesIfInMemory() {
+            return Optional.empty();
+        }
+
+        @Override
+        public PhysicalStateHandleID getStreamStateHandleID() {
+            return delegate.getStreamStateHandleID();
+        }
+
+        @Override
+        public void discardState() throws Exception {
+            delegate.discardState();
+        }
+
+        @Override
+        public long getStateSize() {
+            return delegate.getStateSize();
         }
     }
 

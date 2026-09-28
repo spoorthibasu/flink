@@ -21,10 +21,14 @@ package org.apache.flink.runtime.checkpoint;
 import org.apache.flink.api.common.state.CheckpointListener;
 import org.apache.flink.runtime.operators.coordination.OperatorCoordinator;
 import org.apache.flink.runtime.operators.coordination.OperatorInfo;
+import org.apache.flink.runtime.state.StreamStateHandle;
+import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 
 import javax.annotation.Nullable;
 
 import java.util.concurrent.CompletableFuture;
+
+import static org.apache.flink.util.Preconditions.checkState;
 
 /**
  * This context is the interface through which the {@link CheckpointCoordinator} interacts with an
@@ -67,6 +71,34 @@ public interface OperatorCoordinatorCheckpointContext extends OperatorInfo, Chec
      * <p>In both cases, the coordinator should reset to an empty (new) state.
      */
     void resetToCheckpoint(long checkpointId, @Nullable byte[] checkpointData) throws Exception;
+
+    /**
+     * Whether the coordinator can restore state that is stored in its own file. Such state is read
+     * by the coordinator itself, without blocking the caller, so the JobManager does not need to
+     * keep it in memory. State of coordinators that cannot is always kept inline in the checkpoint
+     * metadata.
+     */
+    default boolean supportsCoordinatorStateInFile() {
+        return false;
+    }
+
+    /**
+     * Resets the coordinator to the checkpoint with the given state, which is either held in memory
+     * or, if {@link #supportsCoordinatorStateInFile()}, stored in its own file.
+     */
+    default void resetToCheckpointFromHandle(
+            long checkpointId, @Nullable StreamStateHandle checkpointState) throws Exception {
+        checkState(
+                checkpointState == null || checkpointState instanceof ByteStreamStateHandle,
+                "The coordinator state of operator %s is stored in %s, but its coordinator can only restore state held in memory.",
+                operatorId(),
+                checkpointState);
+        resetToCheckpoint(
+                checkpointId,
+                checkpointState == null
+                        ? null
+                        : ((ByteStreamStateHandle) checkpointState).getData());
+    }
 
     /**
      * Called if a task is recovered as part of a <i>partial failover</i>, meaning a failover
