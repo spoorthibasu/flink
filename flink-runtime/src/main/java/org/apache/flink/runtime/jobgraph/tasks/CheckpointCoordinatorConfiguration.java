@@ -108,7 +108,7 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 false,
                 false,
                 false,
-                true);
+                false);
     }
 
     private CheckpointCoordinatorConfiguration(
@@ -345,7 +345,7 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         private boolean enableCheckpointsAfterTasksFinish;
         private boolean recoverOutputOnDownstreamTask;
         private boolean pauseSourcesUntilFirstCheckpoint;
-        private boolean coordinatorStateInFileEnabled = true;
+        private boolean coordinatorStateInFileEnabled;
 
         public CheckpointCoordinatorConfiguration build() {
             return new CheckpointCoordinatorConfiguration(

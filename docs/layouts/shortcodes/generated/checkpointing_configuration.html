@@ -28,9 +28,9 @@
         </tr>
         <tr>
             <td><h5>execution.checkpointing.coordinator-state-in-file.enabled</h5></td>
-            <td style="word-wrap: break-word;">true</td>
+            <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>
-            <td>Whether operator coordinator state larger than 'execution.checkpointing.data-inline-threshold' is stored in its own file instead of inline in the root checkpoint metadata file. This applies to coordinators that can restore their state from a file, which includes the coordinators of all sources built on the Source API. Checkpoints with coordinator state in a file use metadata version 7, which earlier Flink versions cannot restore. Disable this to keep new checkpoints restorable by them.</td>
+            <td>Whether operator coordinator state larger than 'execution.checkpointing.data-inline-threshold' is stored in its own file instead of inline in the root checkpoint metadata file. This applies to coordinators that can restore their state from a file, which includes the coordinators of all sources built on the Source API. Checkpoints with coordinator state in a file use metadata version 7, which earlier Flink versions cannot restore.</td>
         </tr>
         <tr>
             <td><h5>execution.checkpointing.create-subdir</h5></td>
