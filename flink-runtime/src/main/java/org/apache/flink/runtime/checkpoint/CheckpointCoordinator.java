@@ -242,6 +242,11 @@ public class CheckpointCoordinator {
     /** Whether coordinators that support it may have their state stored in its own file. */
     private final boolean coordinatorStateInFileEnabled;
 
+    /**
+     * Coordinator state smaller than this stays inline; -1 to use the storage's inline threshold.
+     */
+    private final long coordinatorStateInlineThreshold;
+
     private final boolean recoverOutputOnDownstreamTask;
 
     /** Flag represents there is an in-flight trigger request. */
@@ -338,6 +343,7 @@ public class CheckpointCoordinator {
         this.clock = checkNotNull(clock);
         this.isExactlyOnceMode = chkConfig.isExactlyOnce();
         this.coordinatorStateInFileEnabled = chkConfig.isCoordinatorStateInFileEnabled();
+        this.coordinatorStateInlineThreshold = chkConfig.getCoordinatorStateInlineThreshold();
         this.unalignedCheckpointsEnabled = chkConfig.isUnalignedCheckpointsEnabled();
         this.recoverOutputOnDownstreamTask = chkConfig.isRecoverOutputOnDownstreamTask();
         this.alignedCheckpointTimeout = chkConfig.getAlignedCheckpointTimeout();
@@ -930,7 +936,8 @@ public class CheckpointCoordinator {
                         props,
                         onCompletionPromise,
                         pendingCheckpointStats,
-                        masterTriggerCompletionPromise);
+                        masterTriggerCompletionPromise,
+                        coordinatorStateInlineThreshold);
 
         synchronized (lock) {
             pendingCheckpoints.put(checkpointID, checkpoint);

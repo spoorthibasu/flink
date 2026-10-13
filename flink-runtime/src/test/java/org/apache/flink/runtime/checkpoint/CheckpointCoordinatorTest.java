@@ -3036,6 +3036,125 @@ class CheckpointCoordinatorTest {
     }
 
     @Test
+    void testCoordinatorStateInlineThresholdAppliesWhenStateInFileIsEnabled() throws Exception {
+        assertThat(checkpointCoordinatorState(true, 0, new byte[100]))
+                .isInstanceOf(FileStateHandle.class);
+        assertThat(checkpointCoordinatorState(true, 1024 * 1024, new byte[64 * 1024]))
+                .isInstanceOf(ByteStreamStateHandle.class);
+    }
+
+    @Test
+    void testStorageInlineThresholdAppliesWhenCoordinatorStateInlineThresholdIsNotSet()
+            throws Exception {
+        assertThat(checkpointCoordinatorState(true, -1, new byte[100]))
+                .isInstanceOf(ByteStreamStateHandle.class);
+        assertThat(checkpointCoordinatorState(true, -1, new byte[64 * 1024]))
+                .isInstanceOf(FileStateHandle.class);
+    }
+
+    @Test
+    void testCoordinatorStateInlineThresholdIsIgnoredWhenStateInFileIsDisabled() throws Exception {
+        assertThat(checkpointCoordinatorState(false, 0, new byte[100]))
+                .isInstanceOf(ByteStreamStateHandle.class);
+    }
+
+    /**
+     * Completes one checkpoint on file system storage with the default 20 KB inline threshold and
+     * returns the state of its one coordinator, which can restore its state from a file.
+     */
+    private StreamStateHandle checkpointCoordinatorState(
+            boolean stateInFileEnabled, long inlineThreshold, byte[] state) throws Exception {
+        final JobVertexID jobVertexID = new JobVertexID();
+        final ExecutionGraph graph =
+                new CheckpointCoordinatorTestingUtils.CheckpointExecutionGraphBuilder()
+                        .addJobVertex(jobVertexID)
+                        .build(EXECUTOR_RESOURCE.getExecutor());
+        final ExecutionAttemptID attemptId =
+                graph.getJobVertex(jobVertexID)
+                        .getTaskVertices()[0]
+                        .getCurrentExecutionAttempt()
+                        .getAttemptId();
+        final OperatorID operatorId = new OperatorID();
+        final OperatorCoordinatorCheckpointContext coordinatorContext =
+                new OperatorCoordinatorCheckpointContext() {
+                    @Override
+                    public void checkpointCoordinator(
+                            long checkpointId, CompletableFuture<byte[]> result) {
+                        result.complete(state);
+                    }
+
+                    @Override
+                    public void abortCurrentTriggering() {}
+
+                    @Override
+                    public void notifyCheckpointComplete(long checkpointId) {}
+
+                    @Override
+                    public void resetToCheckpoint(long checkpointId, byte[] checkpointData) {}
+
+                    @Override
+                    public boolean supportsCoordinatorStateInFile() {
+                        return true;
+                    }
+
+                    @Override
+                    public void subtaskReset(int subtask, long checkpointId) {}
+
+                    @Override
+                    public OperatorID operatorId() {
+                        return operatorId;
+                    }
+
+                    @Override
+                    public int maxParallelism() {
+                        return 1;
+                    }
+
+                    @Override
+                    public int currentParallelism() {
+                        return 1;
+                    }
+                };
+        final CheckpointCoordinator checkpointCoordinator =
+                new CheckpointCoordinatorBuilder()
+                        .setCheckpointCoordinatorConfiguration(
+                                CheckpointCoordinatorConfiguration.builder()
+                                        .setCoordinatorStateInFileEnabled(stateInFileEnabled)
+                                        .setCoordinatorStateInlineThreshold(inlineThreshold)
+                                        .build())
+                        .setCheckpointStorage(
+                                new FileSystemCheckpointStorage(
+                                        TempDirUtils.newFolder(tmpFolder).toURI()))
+                        .setTimer(manuallyTriggeredScheduledExecutor)
+                        .setCoordinatorsToCheckpoint(Collections.singleton(coordinatorContext))
+                        .build(graph);
+        try {
+            checkpointCoordinator.triggerCheckpoint(false);
+            manuallyTriggeredScheduledExecutor.triggerAll();
+            final long checkpointId =
+                    Collections.max(checkpointCoordinator.getPendingCheckpoints().keySet());
+            checkpointCoordinator.receiveAcknowledgeMessage(
+                    new AcknowledgeCheckpoint(
+                            graph.getJobID(),
+                            attemptId,
+                            checkpointId,
+                            new CheckpointMetrics(),
+                            null),
+                    TASK_MANAGER_LOCATION_INFO);
+
+            assertThat(checkpointCoordinator.getSuccessfulCheckpoints()).hasSize(1);
+            return checkpointCoordinator
+                    .getSuccessfulCheckpoints()
+                    .get(0)
+                    .getOperatorStates()
+                    .get(operatorId)
+                    .getCoordinatorState();
+        } finally {
+            checkpointCoordinator.shutdown();
+        }
+    }
+
+    @Test
     void testSharedStateRegistrationOnRestore() throws Exception {
         for (RecoveryClaimMode recoveryClaimMode : RecoveryClaimMode.values()) {
             JobVertexID jobVertexID1 = new JobVertexID();

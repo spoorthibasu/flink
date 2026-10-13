@@ -41,6 +41,7 @@ import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.ExecutionOptions;
 import org.apache.flink.configuration.ExternalizedCheckpointRetention;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.StateChangelogOptions;
 import org.apache.flink.core.execution.CheckpointingMode;
@@ -404,6 +405,13 @@ public class StreamGraph implements Pipeline, ExecutionPlan {
                         .setCoordinatorStateInFileEnabled(
                                 jobConfiguration.get(
                                         CheckpointingOptions.COORDINATOR_STATE_IN_FILE))
+                        .setCoordinatorStateInlineThreshold(
+                                jobConfiguration
+                                        .getOptional(
+                                                CheckpointingOptions
+                                                        .COORDINATOR_STATE_INLINE_THRESHOLD)
+                                        .map(MemorySize::getBytes)
+                                        .orElse(-1L))
                         .build(),
                 serializedStateBackend,
                 getJobConfiguration()

@@ -30,7 +30,13 @@
             <td><h5>execution.checkpointing.coordinator-state-in-file.enabled</h5></td>
             <td style="word-wrap: break-word;">false</td>
             <td>Boolean</td>
-            <td>Whether operator coordinator state larger than 'execution.checkpointing.data-inline-threshold' is stored in its own file instead of inline in the root checkpoint metadata file. This applies to coordinators that can restore their state from a file, which includes the coordinators of all sources built on the Source API. Checkpoints with coordinator state in a file use metadata version 7, which earlier Flink versions cannot restore.</td>
+            <td>Whether operator coordinator state can be stored in its own file instead of inline in the root checkpoint metadata file. State smaller than 'execution.checkpointing.coordinator-state-inline-threshold', or 'execution.checkpointing.data-inline-threshold' if that is not set, stays inline. This applies to coordinators that can restore their state from a file, which includes the coordinators of all sources built on the Source API. Checkpoints with coordinator state in a file use metadata version 7, which earlier Flink versions cannot restore.</td>
+        </tr>
+        <tr>
+            <td><h5>execution.checkpointing.coordinator-state-inline-threshold</h5></td>
+            <td style="word-wrap: break-word;">(none)</td>
+            <td>MemorySize</td>
+            <td>When 'execution.checkpointing.coordinator-state-in-file.enabled' is true, operator coordinator state smaller than this size is stored inline in the root checkpoint metadata file, and other coordinator state in its own file. If not set, 'execution.checkpointing.data-inline-threshold' applies. Unlike that option, it does not apply to task state and has no maximum.</td>
         </tr>
         <tr>
             <td><h5>execution.checkpointing.create-subdir</h5></td>

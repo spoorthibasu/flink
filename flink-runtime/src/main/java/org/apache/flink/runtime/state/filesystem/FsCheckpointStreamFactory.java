@@ -150,14 +150,29 @@ public class FsCheckpointStreamFactory implements CheckpointStreamFactory {
     @Override
     public FsCheckpointStateOutputStream createCheckpointStateOutputStream(
             CheckpointedStateScope scope) throws IOException {
+        return createStream(scope, fileStateThreshold);
+    }
+
+    /**
+     * Creates a stream that writes any non-empty state to a file, instead of keeping state up to
+     * this factory's threshold in memory. Overrides of {@link
+     * #createCheckpointStateOutputStream(CheckpointedStateScope)} do not apply to it.
+     */
+    public FsCheckpointStateOutputStream createCheckpointStateOutputStreamWithoutInlining(
+            CheckpointedStateScope scope) throws IOException {
+        return createStream(scope, 0);
+    }
+
+    private FsCheckpointStateOutputStream createStream(
+            CheckpointedStateScope scope, int inlineThreshold) throws IOException {
         Path target = getTargetPath(scope);
-        int bufferSize = Math.max(writeBufferSize, fileStateThreshold);
+        int bufferSize = Math.max(writeBufferSize, inlineThreshold);
 
         // Whether the file system dynamically injects entropy into the file paths.
         final boolean entropyInjecting = EntropyInjector.isEntropyInjecting(filesystem, target);
         final boolean absolutePath = entropyInjecting || scope == CheckpointedStateScope.SHARED;
         return new FsCheckpointStateOutputStream(
-                target, filesystem, bufferSize, fileStateThreshold, !absolutePath);
+                target, filesystem, bufferSize, inlineThreshold, !absolutePath);
     }
 
     public Path getTargetPath(CheckpointedStateScope scope) {

@@ -79,6 +79,11 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
     private final boolean coordinatorStateInFileEnabled;
 
     /**
+     * Coordinator state smaller than this stays inline; -1 to use the storage's inline threshold.
+     */
+    private final long coordinatorStateInlineThreshold;
+
+    /**
      * @deprecated use {@link #builder()}.
      */
     @Deprecated
@@ -108,7 +113,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 false,
                 false,
                 false,
-                false);
+                false,
+                -1);
     }
 
     private CheckpointCoordinatorConfiguration(
@@ -126,7 +132,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
             boolean enableCheckpointsAfterTasksFinish,
             boolean recoverOutputOnDownstreamTask,
             boolean pauseSourcesUntilFirstCheckpoint,
-            boolean coordinatorStateInFileEnabled) {
+            boolean coordinatorStateInFileEnabled,
+            long coordinatorStateInlineThreshold) {
 
         if (checkpointIntervalDuringBacklog < MINIMAL_CHECKPOINT_TIME) {
             // interval of max value means disable periodic checkpoint
@@ -144,6 +151,9 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         Preconditions.checkArgument(
                 !isUnalignedCheckpointsEnabled || maxConcurrentCheckpoints <= 1,
                 "maxConcurrentCheckpoints can't be > 1 if UnalignedCheckpoints enabled");
+        Preconditions.checkArgument(
+                coordinatorStateInlineThreshold >= -1,
+                "coordinatorStateInlineThreshold must be -1 or at least 0");
 
         // max "in between duration" can be one year - this is to prevent numeric overflows
         if (minPauseBetweenCheckpoints > 365L * 24 * 60 * 60 * 1_000) {
@@ -169,6 +179,7 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         this.recoverOutputOnDownstreamTask = recoverOutputOnDownstreamTask;
         this.pauseSourcesUntilFirstCheckpoint = pauseSourcesUntilFirstCheckpoint;
         this.coordinatorStateInFileEnabled = coordinatorStateInFileEnabled;
+        this.coordinatorStateInlineThreshold = coordinatorStateInlineThreshold;
     }
 
     public long getCheckpointInterval() {
@@ -227,6 +238,14 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         return coordinatorStateInFileEnabled;
     }
 
+    /**
+     * Returns the size below which coordinator state stays inline, or -1 if the checkpoint
+     * storage's inline threshold applies.
+     */
+    public long getCoordinatorStateInlineThreshold() {
+        return coordinatorStateInlineThreshold;
+    }
+
     public boolean isRecoverOutputOnDownstreamTask() {
         return recoverOutputOnDownstreamTask;
     }
@@ -252,7 +271,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 && checkpointIdOfIgnoredInFlightData == that.checkpointIdOfIgnoredInFlightData
                 && enableCheckpointsAfterTasksFinish == that.enableCheckpointsAfterTasksFinish
                 && recoverOutputOnDownstreamTask == that.recoverOutputOnDownstreamTask
-                && coordinatorStateInFileEnabled == that.coordinatorStateInFileEnabled;
+                && coordinatorStateInFileEnabled == that.coordinatorStateInFileEnabled
+                && coordinatorStateInlineThreshold == that.coordinatorStateInlineThreshold;
     }
 
     @Override
@@ -270,7 +290,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 checkpointIdOfIgnoredInFlightData,
                 enableCheckpointsAfterTasksFinish,
                 recoverOutputOnDownstreamTask,
-                coordinatorStateInFileEnabled);
+                coordinatorStateInFileEnabled,
+                coordinatorStateInlineThreshold);
     }
 
     @Override
@@ -302,6 +323,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                 + recoverOutputOnDownstreamTask
                 + ", coordinatorStateInFileEnabled="
                 + coordinatorStateInFileEnabled
+                + ", coordinatorStateInlineThreshold="
+                + coordinatorStateInlineThreshold
                 + '}';
     }
 
@@ -346,6 +369,7 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         private boolean recoverOutputOnDownstreamTask;
         private boolean pauseSourcesUntilFirstCheckpoint;
         private boolean coordinatorStateInFileEnabled;
+        private long coordinatorStateInlineThreshold = -1;
 
         public CheckpointCoordinatorConfiguration build() {
             return new CheckpointCoordinatorConfiguration(
@@ -363,7 +387,8 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
                     enableCheckpointsAfterTasksFinish,
                     recoverOutputOnDownstreamTask,
                     pauseSourcesUntilFirstCheckpoint,
-                    coordinatorStateInFileEnabled);
+                    coordinatorStateInFileEnabled,
+                    coordinatorStateInlineThreshold);
         }
 
         public CheckpointCoordinatorConfigurationBuilder setCheckpointInterval(
@@ -446,6 +471,12 @@ public class CheckpointCoordinatorConfiguration implements Serializable {
         public CheckpointCoordinatorConfigurationBuilder setCoordinatorStateInFileEnabled(
                 boolean coordinatorStateInFileEnabled) {
             this.coordinatorStateInFileEnabled = coordinatorStateInFileEnabled;
+            return this;
+        }
+
+        public CheckpointCoordinatorConfigurationBuilder setCoordinatorStateInlineThreshold(
+                long coordinatorStateInlineThreshold) {
+            this.coordinatorStateInlineThreshold = coordinatorStateInlineThreshold;
             return this;
         }
 

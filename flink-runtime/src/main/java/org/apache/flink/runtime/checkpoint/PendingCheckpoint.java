@@ -110,6 +110,11 @@ public class PendingCheckpoint implements Checkpoint {
     /** Operators whose coordinators can restore coordinator state stored in its own file. */
     private final Set<OperatorID> coordinatorStatesThatMayBeStoredInFiles = new HashSet<>();
 
+    /**
+     * Coordinator state smaller than this stays inline; -1 to use the storage's inline threshold.
+     */
+    private final long coordinatorStateInlineThreshold;
+
     private final List<MasterState> masterStates;
 
     private final Set<String> notYetAcknowledgedMasterStates;
@@ -155,7 +160,8 @@ public class PendingCheckpoint implements Checkpoint {
             CheckpointProperties props,
             CompletableFuture<CompletedCheckpoint> onCompletionPromise,
             @Nullable PendingCheckpointStats pendingCheckpointStats,
-            CompletableFuture<Void> masterTriggerCompletionPromise) {
+            CompletableFuture<Void> masterTriggerCompletionPromise,
+            long coordinatorStateInlineThreshold) {
         checkArgument(
                 checkpointPlan.getTasksToWaitFor().size() > 0,
                 "Checkpoint needs at least one vertex that commits the checkpoint");
@@ -190,6 +196,7 @@ public class PendingCheckpoint implements Checkpoint {
         this.onCompletionPromise = checkNotNull(onCompletionPromise);
         this.pendingCheckpointStats = pendingCheckpointStats;
         this.masterTriggerCompletionPromise = checkNotNull(masterTriggerCompletionPromise);
+        this.coordinatorStateInlineThreshold = coordinatorStateInlineThreshold;
     }
 
     // --------------------------------------------------------------------------------------------
@@ -376,10 +383,10 @@ public class PendingCheckpoint implements Checkpoint {
 
     /**
      * Writes the state of coordinators that can restore it from a file through this checkpoint's
-     * storage location, the way subtask state is written. State below the storage's inline
-     * threshold comes back as the same in-memory handle and stays inline in the metadata; larger
-     * state is written to its own file, the metadata only references it, and the bytes are not kept
-     * in memory. The state of other coordinators stays inline.
+     * storage location, the way subtask state is written. State smaller than the inline threshold,
+     * which is the coordinator state threshold if set and the storage's otherwise, stays inline in
+     * the metadata; other state is written to its own file, the metadata only references it, and
+     * the bytes are not kept in memory. The state of other coordinators stays inline.
      */
     private void offloadCoordinatorStates() throws IOException {
         // Only file system storage can put state in its own file. Memory-backed storage caps every
@@ -388,6 +395,7 @@ public class PendingCheckpoint implements Checkpoint {
         if (!(targetLocation instanceof FsCheckpointStreamFactory)) {
             return;
         }
+        final FsCheckpointStreamFactory streamFactory = (FsCheckpointStreamFactory) targetLocation;
         for (OperatorState operatorState : operatorStates.values()) {
             final StreamStateHandle state = operatorState.getCoordinatorState();
             if (!(state instanceof ByteStreamStateHandle)
@@ -396,10 +404,19 @@ public class PendingCheckpoint implements Checkpoint {
                 continue;
             }
             final byte[] data = ((ByteStreamStateHandle) state).getData();
+            if (coordinatorStateInlineThreshold >= 0
+                    && data.length < coordinatorStateInlineThreshold) {
+                continue;
+            }
             final StreamStateHandle persisted;
+            // already checked against the coordinator state threshold, so write it to a file
+            // even if the storage would keep it inline
             try (CheckpointStateOutputStream out =
-                    targetLocation.createCheckpointStateOutputStream(
-                            CheckpointedStateScope.EXCLUSIVE)) {
+                    coordinatorStateInlineThreshold >= 0
+                            ? streamFactory.createCheckpointStateOutputStreamWithoutInlining(
+                                    CheckpointedStateScope.EXCLUSIVE)
+                            : streamFactory.createCheckpointStateOutputStream(
+                                    CheckpointedStateScope.EXCLUSIVE)) {
                 out.write(data);
                 persisted = out.closeAndGetHandle();
             }
