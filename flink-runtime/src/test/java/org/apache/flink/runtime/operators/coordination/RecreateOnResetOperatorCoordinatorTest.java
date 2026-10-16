@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
@@ -51,6 +52,7 @@ class RecreateOnResetOperatorCoordinatorTest {
 
     private static final OperatorID OPERATOR_ID = new OperatorID(1234L, 5678L);
     private static final int NUM_SUBTASKS = 1;
+    private static final String STATE_READER_CLOSER_THREAD = "Coordinator state reader closer";
 
     @Test
     void testQuiesceableContextForwardsProperties() {
@@ -180,6 +182,7 @@ class RecreateOnResetOperatorCoordinatorTest {
 
         assertThat(getInternalCoordinator(coordinator).getLastRestoredCheckpointState())
                 .containsExactly(7);
+        assertThat(slowState.closed.getCount()).isZero();
     }
 
     @Timeout(60)
@@ -195,12 +198,61 @@ class RecreateOnResetOperatorCoordinatorTest {
                 new BlockingStateHandle(new byte[] {1}, earlierReadFails);
 
         coordinator.resetToCheckpointFromHandle(1L, slowState);
+        slowState.reading.await();
         coordinator.resetToCheckpoint(2L, new byte[] {2});
         final TestingOperatorCoordinator afterLaterReset = getInternalCoordinator(coordinator);
         slowState.release();
 
         assertThat(afterLaterReset.getLastRestoredCheckpointState()).containsExactly(2);
         assertThat(getInternalCoordinator(coordinator)).isSameAs(afterLaterReset);
+        assertThat(context.isJobFailed()).isFalse();
+    }
+
+    @Timeout(60)
+    @ParameterizedTest(name = "replacedByLaterReset = {0}, stoppedWhileOpening = {1}")
+    @CsvSource({"true, false", "false, false", "true, true", "false, true"})
+    void testReadOfStateIsStoppedWhenTheResetIsReplacedOrClosed(
+            boolean replacedByLaterReset, boolean stoppedWhileOpening) throws Exception {
+        final MockOperatorCoordinatorContext context =
+                new MockOperatorCoordinatorContext(OPERATOR_ID, NUM_SUBTASKS);
+        final RecreateOnResetOperatorCoordinator coordinator =
+                createCoordinator(new TestingCoordinatorProvider(null), context);
+        final StoppableStateHandle slowState = new StoppableStateHandle();
+
+        coordinator.resetToCheckpointFromHandle(1L, slowState);
+        CommonTestUtils.waitUtil(
+                () -> slowState.readingThread != null,
+                Duration.ofSeconds(10),
+                "The state should be read.");
+        if (!stoppedWhileOpening) {
+            slowState.opened.countDown();
+            slowState.stream.reading.await();
+        }
+        if (replacedByLaterReset) {
+            coordinator.resetToCheckpoint(2L, new byte[] {2});
+        } else {
+            coordinator.close();
+        }
+        if (stoppedWhileOpening) {
+            CommonTestUtils.waitUtil(
+                    () -> !isStoppingAStateRead(),
+                    Duration.ofSeconds(10),
+                    "The read should be stopped.");
+            slowState.opened.countDown();
+        }
+
+        slowState.stream.closed.await();
+        slowState.readingThread.join();
+        if (stoppedWhileOpening) {
+            assertThat(slowState.stream.closingThread).isSameAs(slowState.readingThread);
+        } else {
+            assertThat(slowState.stream.closingThread.getName())
+                    .startsWith(STATE_READER_CLOSER_THREAD);
+        }
+        if (replacedByLaterReset) {
+            assertThat(getInternalCoordinator(coordinator).getLastRestoredCheckpointState())
+                    .containsExactly(2);
+        }
         assertThat(context.isJobFailed()).isFalse();
     }
 
@@ -388,6 +440,11 @@ class RecreateOnResetOperatorCoordinatorTest {
         return (RecreateOnResetOperatorCoordinator) provider.create(context);
     }
 
+    private static boolean isStoppingAStateRead() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .anyMatch(thread -> thread.getName().startsWith(STATE_READER_CLOSER_THREAD));
+    }
+
     private TestingOperatorCoordinator getInternalCoordinator(
             RecreateOnResetOperatorCoordinator coordinator) throws Exception {
         return (TestingOperatorCoordinator) coordinator.getInternalCoordinator();
@@ -425,12 +482,17 @@ class RecreateOnResetOperatorCoordinatorTest {
         }
     }
 
-    /** State whose read blocks until released, then returns the given bytes or fails. */
+    /**
+     * State whose reads block until released, even if the stream is closed, and then return the
+     * given bytes or fail.
+     */
     private static class BlockingStateHandle implements StreamStateHandle {
         private static final long serialVersionUID = 1L;
         private final byte[] bytes;
         private final boolean fail;
+        private final CountDownLatch reading = new CountDownLatch(1);
         private final CountDownLatch released = new CountDownLatch(1);
+        private final CountDownLatch closed = new CountDownLatch(1);
         private volatile Thread readingThread;
 
         private BlockingStateHandle(byte[] bytes, boolean fail) {
@@ -451,16 +513,39 @@ class RecreateOnResetOperatorCoordinatorTest {
         @Override
         public FSDataInputStream openInputStream() throws IOException {
             readingThread = Thread.currentThread();
-            try {
-                released.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException(e);
-            }
-            if (fail) {
-                throw new IOException("Expected test failure");
-            }
-            return new ByteStreamStateHandle("state", bytes).openInputStream();
+            final FSDataInputStream data =
+                    new ByteStreamStateHandle("state", bytes).openInputStream();
+            return new FSDataInputStream() {
+                @Override
+                public int read() throws IOException {
+                    reading.countDown();
+                    try {
+                        released.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(e);
+                    }
+                    if (fail) {
+                        throw new IOException("Expected test failure");
+                    }
+                    return data.read();
+                }
+
+                @Override
+                public void close() {
+                    closed.countDown();
+                }
+
+                @Override
+                public void seek(long desired) throws IOException {
+                    data.seek(desired);
+                }
+
+                @Override
+                public long getPos() throws IOException {
+                    return data.getPos();
+                }
+            };
         }
 
         @Override
@@ -479,6 +564,79 @@ class RecreateOnResetOperatorCoordinatorTest {
         @Override
         public long getStateSize() {
             return bytes.length;
+        }
+    }
+
+    /** State whose stream opens once allowed to, and whose reads block until it is closed. */
+    private static class StoppableStateHandle implements StreamStateHandle {
+        private static final long serialVersionUID = 1L;
+        private final CountDownLatch opened = new CountDownLatch(1);
+        private final BlockingInputStream stream = new BlockingInputStream();
+        private volatile Thread readingThread;
+
+        @Override
+        public FSDataInputStream openInputStream() throws IOException {
+            readingThread = Thread.currentThread();
+            try {
+                opened.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+            return stream;
+        }
+
+        @Override
+        public Optional<byte[]> asBytesIfInMemory() {
+            return Optional.empty();
+        }
+
+        @Override
+        public PhysicalStateHandleID getStreamStateHandleID() {
+            return new PhysicalStateHandleID("stoppable");
+        }
+
+        @Override
+        public void discardState() {}
+
+        @Override
+        public long getStateSize() {
+            return 0;
+        }
+    }
+
+    /** A stream whose reads block until it is closed, and then fail. */
+    private static class BlockingInputStream extends FSDataInputStream {
+        private final CountDownLatch reading = new CountDownLatch(1);
+        private final CountDownLatch closed = new CountDownLatch(1);
+        private volatile Thread closingThread;
+
+        @Override
+        public int read() throws IOException {
+            reading.countDown();
+            try {
+                closed.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+            throw new IOException("The stream is closed.");
+        }
+
+        @Override
+        public void close() {
+            closingThread = Thread.currentThread();
+            closed.countDown();
+        }
+
+        @Override
+        public void seek(long desired) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public long getPos() {
+            return 0;
         }
     }
 
